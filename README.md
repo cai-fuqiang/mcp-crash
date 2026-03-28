@@ -1,6 +1,6 @@
 # Crash MCP Server
 
-**内核崩溃转储分析的进程常驻代理**。针对大模型直接调用 crash 时每次命令都需重新启动进程、重新加载 vmcore（耗时数分钟）的效率瓶颈，该服务通过 PTY 伪终端启动 crash 进程并保持会话常驻，使 crash 自身加载的符号表和内核数据结构持续驻留内存。大模型通过 MCP 协议提交命令，服务透传至后台进程并实时返回输出，规避进程重复创建和 vmcore 重复加载的开销，将响应延迟从分钟级降至秒级，支持多转储文件并发会话管理。
+针对大模型直接调用 crash 时 **每次命令都需重新启动进程、重新加载 vmcore（耗时数分钟）** 的效率瓶颈，该服务通过 PTY 伪终端启动 crash 进程并保持会话常驻，使 crash 自身加载的符号表和内核数据结构持续驻留内存。大模型通过 MCP 协议提交命令，服务透传至后台进程并实时返回输出，规避进程重复创建和 vmcore 重复加载的开销，将响应延迟从分钟级降至秒级，支持多转储文件并发会话管理。
 
 ## 功能
 
@@ -63,21 +63,44 @@ sudo make uninstall
 
 ## MCP 工具
 
-1. **init_crash** - 初始化会话
+### 1. **init_crash** - 初始化会话
    ```json
    {"crash": "/usr/bin/crash", "vmlinux": "/path/vmlinux", "vmcore": "/path/vmcore"}
    ```
    返回：`{"session_id": "uuid"}`
 
-2. **execute** - 执行命令
+  ![init](doc/images/init.png)
+
+### 2. **execute** - 执行命令
    ```json
    {"session_id": "uuid", "command": "bt"}
    ```
 
-3. **close** - 关闭会话
+  ![exec](doc/images/exec.png)
+
+### 3. **list_sessions** - 列出所有会话
+   ```json
+   {}
+   ```
+   返回：会话列表数组，每个元素包含会话信息
+   ```json
+   [
+     {
+       "id": "uuid-string",
+       "vmlinux": "/path/to/vmlinux",
+       "vmcore": "/path/to/vmcore",
+       "created": "2024-01-01T00:00:00Z",
+       "last_used": "2024-01-01T00:00:00Z",
+       "active": true
+     }
+   ]
+   ```
+
+  ![list](doc/images/sessions.png)
+
+### 4. **close** - 关闭会话
    ```json
    {"session_id": "uuid"}
    ```
 
-4. **list_sessions** - 列会话
-```
+  ![close](doc/images/close.png)
