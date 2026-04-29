@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "crash": {
+      "command": "python3",
+      "args": [
+        "/path/to/crash_mcp.py",
+        "--remote",
+        "bastion.example.com:7891"
+      ]
+    }
+  }
+}
