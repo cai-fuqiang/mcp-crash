@@ -123,7 +123,7 @@ sp+0xa08   | ip_route_input_slow+2388       | net/ipv4/route.c:2343 → fib_vali
 
 - **为何不响应中断**：`die()` → `raw_spin_lock_irq` 先关中断再等锁。CRMD = 0xb0 永久 -IE
 - **为何进入异常**：`ip_route_input_slow` 中的 ALE → `do_ale` 诊断输出路径 → 二次 page fault
-- **`do_ale` 的致命设计缺陷**：`show_registers(regs)` 在 `emulate_load_store_insn` 之前执行。即使 ALE 可以模拟恢复、系统能继续运行，诊断打印中的二次异常已经先一步触发了 `die("Oops")`
+- **`do_ale` 的设计缺陷**：`show_registers(regs)` 在 `emulate_load_store_insn` 之前执行。即使 ALE 可以模拟恢复、系统能继续运行，诊断打印中的二次异常可能先一步触发 `die("Oops")`
 
 ## 5. 深挖 CPU 3：BUG_ON 诱发的自死锁
 
@@ -497,7 +497,7 @@ Live 验证确认 vmcore 数据的准确性和 hres_active=1 的持续性。
             缓存一致性错误）无法从单一 vmcore 精确确定
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-第二层 · 致命放大（两个 CPU 以相同模式崩溃）
+第二层 · 二次崩溃（两个 CPU 以相同模式触发）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   CPU 3: die("Oops - BUG") → 拿 die_lock → show_registers → printk
            → console 输出中触发二次 page fault → die("Oops")
@@ -519,7 +519,7 @@ Live 验证确认 vmcore 数据的准确性和 hres_active=1 的持续性。
 ### 核心发现
 
 1. **触发源为 BREAK 异常，根因无法精确定位**：`break 0x1` 指令确凿在 `hrtimer_interrupt:1856`。但 dump 时全 CPU `hres_active = 1`（live QEMU 确认），BUG_ON 条件在 dump 时刻为 false。BREAK 发生时 `ld.bu $s5, 16` 读到瞬态错误值 0——是硬件 bit flip、per-CPU offset 错位、还是缓存一致性问题，无法从单一 vmcore 确定
-2. **致命放大因素**：`die()` → `show_registers() → printk() → console_flush_all()` 在系统不稳定时触发二次异常。`do_ale` 中 `show_registers` 在模拟决策之前执行，将可恢复异常放大为致命死锁
+2. **二次崩溃因素**：`die()` → `show_registers() → printk() → console_flush_all()` 在系统不稳定时可能触发二次异常。`do_ale` 中 `show_registers` 在模拟决策之前执行，可能将可恢复异常升级为死锁
 3. **自死锁机制**：CPU 3 的外层 die() 持锁 + 内层嵌套 die() 等锁，形成不可恢复的单 CPU 死锁
 4. **全系统波及**：两个 CPU 关中断无法响应 IPI → 其余 6 CPU 在 TLB flush 等待中永久阻塞
 5. **console 路径并发崩溃**：uart_port 结构体 14 字段被损坏，`oops_in_progress` 绕锁导致两个 CPU 同时进入同一 `univ8250_console_write` 踩坏内存
@@ -649,7 +649,7 @@ LoongArch KVM 中断投递可靠性。
 
 | 问题 | 当前状态 |
 |------|---------|
-| **`show_registers` 在 `emulate_load_store_insn` 之前执行** | v7.1-rc1 中 `do_ale()` 仍先调用 `show_registers()` 再模拟。可恢复异常仍会被诊断打印中的二次异常放大 |
+| **`show_registers` 在 `emulate_load_store_insn` 之前执行** | v7.1-rc1 中 `do_ale()` 仍先调用 `show_registers()` 再模拟。可恢复异常仍可能被诊断打印中的二次异常升级为死锁 |
 
 ### 建议合入补丁
 
