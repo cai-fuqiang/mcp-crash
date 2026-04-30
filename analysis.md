@@ -559,9 +559,33 @@ commit 日期晚于内核构建日期（Jun 2025），不在当前 6.6.0 中。
 **必须合入（直接命中）：**
 
 1. **`7f8fdd4dbffc` serial: 8250: fix panic due to PSLVERR**（Jul 2025）
-   > 修复 8250 串口两个 CPU 并发访问时 UART LCR 被意外修改导致 panic。
-   > `serial_port_out(port, UART_LCR, ...)` 放入 `port->lock` 保护。
-   > 直接命中本次 crash 的并发场景。
+
+   该补丁修改的是 `serial8250_initialize()`，此函数在 6.11+ 才从
+   `serial8250_do_startup()` 拆分出来，无法直接 cherry-pick。
+
+   6.6.0 backport 如下：
+
+```diff
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -2375,9 +2375,9 @@ int serial8250_do_startup(struct uart_port *port)
+ 	/*
+ 	 * Now, initialize the UART
+ 	 */
+-	serial_port_out(port, UART_LCR, UART_LCR_WLEN8);
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
++	serial_port_out(port, UART_LCR, UART_LCR_WLEN8);
+ 	if (up->port.flags & UPF_FOURPORT) {
+ 		if (!up->port.irq)
+ 			up->port.mctrl |= TIOCM_OUT1;
+```
+
+   生效逻辑：将 `serial_port_out(LCR)` 放入 `port->lock` 保护，防止 CPU A
+   （printk→console）持有锁写 UART 时，CPU B（startup）在锁外通过
+   `serial_port_out(LCR)` 触发 `dw8250_check_lcr()` → `dw8250_force_idle()`
+   → `serial8250_clear_and_reinit_fifos()` → `serial_port_in(RX)` 导致 PSLVERR。
+   `flags` 变量在函数开头（line 2186）已声明，上移无作用域问题。
 
 **建议合入（本分析发现的代码缺陷）：**
 
