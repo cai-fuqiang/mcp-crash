@@ -137,7 +137,7 @@ static session_t* session_create(const char *vmlinux, const char *vmcore) {
         dup2(stdin_pipe[0], STDIN_FILENO);
         dup2(stdout_pipe[1], STDOUT_FILENO);
         close(stdin_pipe[0]); close(stdout_pipe[1]);
-        execlp("crash", "crash", vmlinux, vmcore, (char*)NULL);
+        execlp("stdbuf", "stdbuf", "-oL", "crash", vmlinux, vmcore, (char*)NULL);
         _exit(1);
     }
     
@@ -147,28 +147,40 @@ static session_t* session_create(const char *vmlinux, const char *vmcore) {
     s->stdout_fd = stdout_pipe[0];
     s->created = s->last_active = time(NULL);
     s->active = 1;
-    
-    // 等待crash启动
+
+    // 检查子进程是否立即退出（vmlinux/vmcore 路径无效等）
+    usleep(100000);
+    int wstatus;
+    if (waitpid(pid, &wstatus, WNOHANG) == pid) {
+        session_close(s);
+        free(s);
+        return NULL;
+    }
+
+    write_all(s->stdin_fd, "set scroll off\n", 15);
+
+    // 等待 crash 初始化完成（读到第一个 crash> 提示符）
+    // 大 vmcore 可能加载数分钟，超时设为 600 秒
     fd_set rfds;
     struct timeval tv;
-    char buf[1024];
-    int prompt_found = 0;
-    time_t start = time(NULL);
-    
-    while (!prompt_found && (time(NULL) - start) < CRASH_TIMEOUT) {
+    char buf[4096];
+    time_t init_start = time(NULL);
+    int ready = 0;
+    while (!ready && (time(NULL) - init_start) < 600) {
         FD_ZERO(&rfds); FD_SET(s->stdout_fd, &rfds);
         tv.tv_sec = 1; tv.tv_usec = 0;
-        if (select(s->stdout_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
-            ssize_t n = read(s->stdout_fd, buf, sizeof(buf) - 1);
-            if (n > 0 && strstr(buf, "crash>")) prompt_found = 1;
-            else if (n == 0) break;
-        }
+        if (select(s->stdout_fd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
+        ssize_t n = read(s->stdout_fd, buf, sizeof(buf) - 1);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        if (strstr(buf, "crash>")) ready = 1;
     }
-    
-    // 禁用分页
-    write_all(s->stdin_fd, "set scroll off\n", 15);
-    usleep(100000);
-    
+    if (!ready) {
+        session_close(s);
+        free(s);
+        return NULL;
+    }
+
     s->next = sessions;
     sessions = s;
     return s;
@@ -226,9 +238,10 @@ static int session_exec(session_t *s, const char *cmd, char *output, size_t outp
         }
     }
     
+    if (total >= output_size) total = output_size - 1;
     output[total] = '\0';
     s->last_active = time(NULL);
-    return total;
+    return (int)total;
 }
 
 static int session_close(session_t *s) {
@@ -264,79 +277,83 @@ static void session_cleanup(void) {
 /* ============ TCP服务器模式 ============ */
 static int handle_client(int client_fd) {
     char line[MAX_LINE_SIZE], req_id[64], type[64], payload[MAX_LINE_SIZE];
-    
-    while (1) {
-        if (read_line(client_fd, line, sizeof(line)) <= 0) break;
-        
-        char *p = line;
-        char *pipe1 = strchr(p, '|');
-        if (!pipe1) continue;
-        
-        size_t id_len = pipe1 - p;
-        if (id_len < 64) { strncpy(req_id, p, id_len); req_id[id_len] = '\0'; }
-        
-        char *pipe2 = strchr(pipe1 + 1, '|');
-        if (!pipe2) continue;
-        
-        size_t type_len = pipe2 - pipe1 - 1;
-        if (type_len < 64) { strncpy(type, pipe1 + 1, type_len); type[type_len] = '\0'; }
-        
-        strcpy(payload, pipe2 + 1);
-        
-        session_t *session;
-        char response[MAX_LINE_SIZE];
-        int status = ERR_OK;
-        const char *output = "";
-        
-        if (strcmp(type, "init") == 0) {
-            char *vmlinux = payload;
-            char *vmcore = strchr(payload, '|');
-            if (vmcore) { *vmcore = '\0'; vmcore++; }
-            session = session_create(vmlinux, vmcore ? vmcore : "");
-            if (!session) { status = ERR_INIT_FAILED; output = "Failed"; }
-            else { snprintf(response, sizeof(response), "%s|%s|%s", session->vmlinux, session->vmcore, session->id); output = response; }
-        }
-        else if (strcmp(type, "exec") == 0) {
-            char *session_id = payload;
-            char *cmd = strchr(payload, '|');
-            if (cmd) { *cmd = '\0'; cmd++; }
-            session = session_find(session_id);
-            if (!session) { status = ERR_SESSION_NOT_FOUND; output = "Not found"; }
-            else { char out[MAX_LINE_SIZE] = {0}; int ret = session_exec(session, cmd ? cmd : "", out, sizeof(out) - 1); if (ret < 0) status = ret; snprintf(response, sizeof(response), "%s", out); output = response; }
-        }
-        else if (strcmp(type, "close") == 0) {
-            session = session_find(payload);
-            if (session) session_close(session);
-            output = "Closed";
-        }
-        else if (strcmp(type, "heartbeat") == 0) {
-            session = session_find(payload);
-            if (session) session->last_active = time(NULL);
-        }
-        else if (strcmp(type, "list") == 0) {
-            int count = 0;
-            session_t *s = sessions;
-            while (s) { if (s->active) count++; s = s->next; }
-            snprintf(response, sizeof(response), "%d", count);
-            s = sessions;
-            while (s) {
-                if (s->active) { char entry[MAX_LINE_SIZE]; snprintf(entry, sizeof(entry), "|%s|%s|%s", s->id, s->vmlinux, s->vmcore); strcat(response, entry); }
-                s = s->next;
-            }
-            output = response;
-        }
-        else if (strcmp(type, "quit") == 0) {
-            char resp[MAX_LINE_SIZE];
-            snprintf(resp, sizeof(resp), "%s|%d|%s\n", req_id, status, "Bye");
-            write_all(client_fd, resp, strlen(resp));
-            break;
-        }
-        else { status = ERR_PARSE; output = "Unknown"; }
-        
-        char resp[MAX_LINE_SIZE];
-        snprintf(resp, sizeof(resp), "%s|%d|%s\n", req_id, status, output);
-        write_all(client_fd, resp, strlen(resp));
+
+    fprintf(stderr, "[LOG] handle_client: waiting for request...\n");
+
+    if (read_line(client_fd, line, sizeof(line)) <= 0) {
+        fprintf(stderr, "[LOG] handle_client: read_line returned <=0, exiting\n");
+        return -1;
     }
+    fprintf(stderr, "[LOG] handle_client: received line=[%s]\n", line);
+
+    char *p = line;
+    char *pipe1 = strchr(p, '|');
+    if (!pipe1) return -1;
+
+    size_t id_len = pipe1 - p;
+    if (id_len < 64) { strncpy(req_id, p, id_len); req_id[id_len] = '\0'; }
+
+    char *pipe2 = strchr(pipe1 + 1, '|');
+    if (!pipe2) return -1;
+
+    size_t type_len = pipe2 - pipe1 - 1;
+    if (type_len < 64) { strncpy(type, pipe1 + 1, type_len); type[type_len] = '\0'; }
+
+    strcpy(payload, pipe2 + 1);
+
+    fprintf(stderr, "[LOG] handle_client: type=[%s], req_id=[%s]\n", type, req_id);
+
+    session_t *session;
+    char response[MAX_LINE_SIZE];
+    int status = ERR_OK;
+    const char *output = "";
+
+    if (strcmp(type, "init") == 0) {
+        fprintf(stderr, "[LOG] handle_client: processing init request\n");
+        char *vmlinux = payload;
+        char *vmcore = strchr(payload, '|');
+        if (vmcore) { *vmcore = '\0'; vmcore++; }
+        session = session_create(vmlinux, vmcore ? vmcore : "");
+        if (!session) { status = ERR_INIT_FAILED; output = "Failed"; }
+        else { snprintf(response, sizeof(response), "%s|%s|%s", session->vmlinux, session->vmcore, session->id); output = response; }
+    }
+    else if (strcmp(type, "exec") == 0) {
+        char *session_id = payload;
+        char *cmd = strchr(payload, '|');
+        if (cmd) { *cmd = '\0'; cmd++; }
+        session = session_find(session_id);
+        if (!session) { status = ERR_SESSION_NOT_FOUND; output = "Not found"; }
+        else { char out[MAX_LINE_SIZE] = {0}; int ret = session_exec(session, cmd ? cmd : "", out, sizeof(out) - 1); if (ret < 0) status = ret; snprintf(response, sizeof(response), "%s", out); output = response; }
+    }
+    else if (strcmp(type, "close") == 0) {
+        session = session_find(payload);
+        if (session) session_close(session);
+        output = "Closed";
+    }
+    else if (strcmp(type, "heartbeat") == 0) {
+        session = session_find(payload);
+        if (session) session->last_active = time(NULL);
+    }
+    else if (strcmp(type, "list") == 0) {
+        int count = 0;
+        session_t *s = sessions;
+        while (s) { if (s->active) count++; s = s->next; }
+        snprintf(response, sizeof(response), "%d", count);
+        s = sessions;
+        while (s) {
+            if (s->active) { char entry[MAX_LINE_SIZE]; snprintf(entry, sizeof(entry), "|%s|%s|%s", s->id, s->vmlinux, s->vmcore); strcat(response, entry); }
+            s = s->next;
+        }
+        output = response;
+    }
+    else { status = ERR_PARSE; output = "Unknown"; }
+
+    fprintf(stderr, "[LOG] handle_client: done processing, status=%d\n", status);
+    char resp[MAX_LINE_SIZE];
+    snprintf(resp, sizeof(resp), "%s|%d|%s\n", req_id, status, output);
+    fprintf(stderr, "[LOG] handle_client: sending response [%.100s]\n", resp);
+    write_all(client_fd, resp, strlen(resp));
+    fprintf(stderr, "[LOG] handle_client: response sent, returning\n");
     return 0;
 }
 
@@ -361,6 +378,7 @@ static void server_loop(void) {
             int client_fd = accept(server_sock, (struct sockaddr*)&client_addr, &addr_len);
             if (client_fd >= 0) {
                 handle_client(client_fd);
+                shutdown(client_fd, SHUT_RDWR);
                 close(client_fd);
             }
         }
