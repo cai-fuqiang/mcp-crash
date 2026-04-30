@@ -487,11 +487,14 @@ Live 验证确认 vmcore 数据的准确性和 hres_active=1 的持续性。
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-第一层 · 引爆点
+第一层 · 引爆点 —— BREAK 异常
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   CPU 3: hrtimer_interrupt → BUG_ON(!cpu_base->hres_active) → break 0x1
-         根因: 瞬态硬件错误（load 读到错误值 0 或 per-CPU offset 瞬时错位）
-         反汇编 + ERA + struct 偏移三重锁定，100% 确认位置
+         位置: 反汇编 + ERA (BRK_BUG=1) + struct 偏移 (offset 16) 三重锁定
+         指令: ld.bu $t0, $s5, 16; bstrpick bit0; beqz → break 0x1
+         ★ hres_active 在 dump 时全 CPU = 1，live QEMU 确认一致
+         ★ 瞬态根因（load 读到错误值 0 / per-CPU offset 瞬时错位 /
+            缓存一致性错误）无法从单一 vmcore 精确确定
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 第二层 · 致命放大（两个 CPU 以相同模式崩溃）
@@ -515,7 +518,7 @@ Live 验证确认 vmcore 数据的准确性和 hres_active=1 的持续性。
 
 ### 核心发现
 
-1. **触发源不是软件 bug**：`BUG_ON` 由瞬态硬件错误触发（hres_active 在 dump 时已确认为 1），非持续性内核状态错误
+1. **触发源为 BREAK 异常，根因无法精确定位**：`break 0x1` 指令确凿在 `hrtimer_interrupt:1856`。但 dump 时全 CPU `hres_active = 1`（live QEMU 确认），BUG_ON 条件在 dump 时刻为 false。BREAK 发生时 `ld.bu $s5, 16` 读到瞬态错误值 0——是硬件 bit flip、per-CPU offset 错位、还是缓存一致性问题，无法从单一 vmcore 确定
 2. **致命放大因素**：`die()` → `show_registers() → printk() → console_flush_all()` 在系统不稳定时触发二次异常。`do_ale` 中 `show_registers` 在模拟决策之前执行，将可恢复异常放大为致命死锁
 3. **自死锁机制**：CPU 3 的外层 die() 持锁 + 内层嵌套 die() 等锁，形成不可恢复的单 CPU 死锁
 4. **全系统波及**：两个 CPU 关中断无法响应 IPI → 其余 6 CPU 在 TLB flush 等待中永久阻塞
