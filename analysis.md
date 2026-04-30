@@ -522,6 +522,7 @@ Live 验证确认 vmcore 数据的准确性和 hres_active=1 的持续性。
 2. **致命放大因素**：`die()` → `show_registers() → printk() → console_flush_all()` 在系统不稳定时触发二次异常。`do_ale` 中 `show_registers` 在模拟决策之前执行，将可恢复异常放大为致命死锁
 3. **自死锁机制**：CPU 3 的外层 die() 持锁 + 内层嵌套 die() 等锁，形成不可恢复的单 CPU 死锁
 4. **全系统波及**：两个 CPU 关中断无法响应 IPI → 其余 6 CPU 在 TLB flush 等待中永久阻塞
+6. **KVM 定时器丢失加速 RCU stall**：TLB shootdown 期间其他 CPU 大量发送 IPI 到 CPU0/3，每次软件 IPI 注入可能覆盖 passthrough HW 定时器中断，导致 CPU0/3 的 tick 丢失，加速 RCU Grace Period 检测到 stall（见 §12）
 5. **console 路径并发崩溃**：uart_port 结构体 14 个字段被损坏（serial_in、serial_out 等函数指针被替换为非法值）。两个 CPU 通过独立路径同时进入 `serial8250_console_write`，`oops_in_progress` 绕锁导致对同一 uart_port 的并发访问踩坏内存
 
 ### 方法论
@@ -547,6 +548,95 @@ Live 验证确认 vmcore 数据的准确性和 hres_active=1 的持续性。
 
 与 CPU 0/3 同时在 `serial8250_console_write` 并发访问同一 UART 的场景吻合。
 commit 日期晚于内核构建日期（Jun 2025），不在当前 6.6.0 中。
+
+---
+
+## 12. RCU stall × KVM 定时器丢失：复合放大机制
+
+### Claude Code 分析中的 RCU stall 证据
+
+Claude Code 独立分析同一 vmcore 时，从 dmesg ring buffer 中提取了 RCU stall 信息：
+
+```
+CPU0: rcu: 0-...!: (23 ticks this GP) idle=59a4/0/0x3
+      softirq=314610332/314610332 fqs=0
+      → softirq 计数冻结，CPU0 未处理任何软中断
+      → 23 ticks this GP：Grace Period 内仅 23 个 tick，几乎静止
+
+CPU3: rcu: 3-...!: (1 GPs behind) idle=a644/1/0x4000000000000000
+      softirq=161060137/161060137 fqs=0
+      → 同样 softirq 冻结
+
+rcu_sched kthread starved for 203,890,287 jiffies!  (~815,561 秒)
+```
+
+CPU0 和 CPU3 在 RCU 视角下完全无响应。NMI backtrace 发送均失败：
+```
+Sending NMI from CPU N to CPUs 0:
+Unable to send backtrace IPI to CPU0 - perhaps it hung?
+```
+
+### Bibo Mao KVM 定时器丢失补丁
+
+`20260414072313.3801110-1-maobibo@loongson.cn` (Apr 14, 2026)
+「LoongArch: KVM: Fix HW timer interrupt lost when inject interrupt from software」
+
+**Bug 描述**：
+> When inject emulated CPU interrupt by software such CPU_SIP0/CPU_IPI,
+> HW timer interrupt may be lost.
+
+**修复逻辑**（`arch/loongarch/kvm/interrupt.c`）：
+```c
+// kvm_irq_deliver() 中，软件注入 IPI/SWI 前后：
+old = kvm_read_hw_gcsr(LOONGARCH_CSR_TVAL);  // 读定时器 tick
+set_gcsr_estat(irq);                          // 注入软件中断
+new = kvm_read_hw_gcsr(LOONGARCH_CSR_TVAL);  // 再读定时器 tick
+if (new > old)                                 // tick 值反转 → 定时器被覆盖
+    set_gcsr_estat(CPU_TIMER);               // 手动补注定时器中断
+```
+
+**`Fixes: f45ad5b8aa93` (v6.7+)**，意味着 **6.6.0 内核不包含原始 commit**，但同样受影响。
+
+### 链式放大机制
+
+```
+TLB flush 风暴 (CPU1-7)
+  └→ 每次 smp_call_function 发送 IPI 到 CPU0/3
+       └→ KVM 软件注入 IPI (set_gcsr_estat)
+            └→ ★ HW 定时器中断被覆盖丢失
+                 ├→ CPU0/3 tick 停止更新
+                 ├→ watchdog 无法在 CPU0/3 上触发
+                 ├→ RCU callback 无法处理
+                 └→ rcu_sched kthread 饥饿 → RCU stall
+```
+
+**三层复合放大**：
+
+| 层 | 机制 | 效应 |
+|----|------|------|
+| ① 定时器丢失 | 每次软件 IPI 可覆盖 HW 定时器 | CPU0/3 tick 停止，watchdog 静默 |
+| ② RCU stall | tick 停止 → 无 quiescent state | `rcu_sched` 饥饿 ~800k 秒 |
+| ③ 全系统延迟放大 | RCU stall 阻塞内存回收 | 内存压力加剧 → 更多 TLB flush |
+
+第③层解释了为什么系统在 33 天运行中**缓慢恶化**：TLB flush 越多 → IPI 越多
+→ 定时器丢失越多 → RCU stall 越严重 → 内存压力越大 → 更多 madvise/mprotect
+→ 更多 TLB flush。最终在第 1.7 小时内指数级加速至全系统死锁。
+
+### 相关 fix commit：`02a6a1f9d77a`
+
+上游 v7.1-rc1 已合入 `02a6a1f9d77a`：「LoongArch: Make arch_irq_work_has_interrupt()
+true only if IPI HW exist」。该补丁检查 IPI 硬件是否真正存在，避免在无 IPI 硬件
+的虚拟化配置下错误地依赖 `irq_work` 机制。与定时器丢失补丁互补，共同提升
+LoongArch KVM 中断投递可靠性。
+
+### 建议合入（新增）
+
+| 补丁 | 日期 | 针对问题 |
+|------|------|---------|
+| `20260414072313` (PATCH 2/3) | Apr 2026 | KVM 软件 IPI 注入时 HW 定时器丢失 |
+| `02a6a1f9d77a` | v7.1-rc1 | `arch_irq_work_has_interrupt()` 在无 IPI HW 时应返回 false |
+
+两者合并可防止 IPI 风暴导致的定时器静默和 RCU stall 放大效应。
 
 ### 仍未修复（v7.1-rc1）
 
